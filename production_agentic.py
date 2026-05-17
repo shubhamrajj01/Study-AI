@@ -29,7 +29,7 @@ import google.generativeai as genai
 from pypdf import PdfReader
 
 # Embeddings
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 # FAISS Vector Index
 import faiss
@@ -44,10 +44,12 @@ from deep_translator import GoogleTranslator
 # NeonDB persistence layer
 import db_postgres as db
 
-# Auth + Chat History routes
+# Auth + Chat History + Progress + Study Materials routes
 from routes_auth import router as auth_router
 from routes_chat_history import router as chat_history_router
 from routes_evaluation import router as evaluation_router
+from routes_progress import router as progress_router
+from routes_study_materials import router as study_materials_router
 from auth import get_optional_user
 from llm_provider import llm_generate, get_provider_info
 
@@ -63,15 +65,16 @@ if GEMINI_API_KEY:
 # ─── Embedding Service (singleton) ────────────────────────────────────────────
 
 class EmbeddingService:
-    """Loads sentence-transformer model once; thread-safe embedding generation."""
+    """Loads fastembed model once; thread-safe embedding generation."""
 
-    MODEL_NAME = "all-MiniLM-L6-v2"
+    MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
     _instance: Optional["EmbeddingService"] = None
 
     def __init__(self):
-        print(f"[EMBED] Loading model '{self.MODEL_NAME}'…")
-        self._model = SentenceTransformer(self.MODEL_NAME)
-        self._dim   = self._model.get_sentence_embedding_dimension()
+        print(f"[EMBED] Loading model '{self.MODEL_NAME}' in fastembed (no PyTorch)…")
+        # fastembed uses ONNX runtime, greatly saving memory
+        self._model = TextEmbedding(model_name=self.MODEL_NAME)
+        self._dim   = 384  # fixed dimension for all-MiniLM-L6-v2
         print(f"[EMBED] [OK] Model ready — dim={self._dim}")
 
     @classmethod
@@ -86,7 +89,13 @@ class EmbeddingService:
 
     def encode(self, texts: List[str]) -> np.ndarray:
         """Return float32 L2-normalised embedding matrix."""
-        vecs = self._model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        if not texts:
+            return np.empty((0, self._dim), dtype=np.float32)
+        # fastembed returns a generator of numpy arrays
+        vecs_list = list(self._model.embed(texts))
+        if not vecs_list:
+            return np.empty((0, self._dim), dtype=np.float32)
+        vecs = np.vstack(vecs_list)
         faiss.normalize_L2(vecs.astype(np.float32))
         return vecs.astype(np.float32)
 
@@ -167,11 +176,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Register Auth + Chat History Routers ──────────────────────────────────────
+# ─── Register Auth + Chat History + Progress Routers ──────────────────────────
 
 app.include_router(auth_router)
 app.include_router(chat_history_router)
 app.include_router(evaluation_router)
+app.include_router(progress_router)
+app.include_router(study_materials_router)
 
 # ─── Startup / Shutdown ────────────────────────────────────────────────────────
 
@@ -733,7 +744,7 @@ async def generate_study_guide_with_gemini(
     full_context = "\n\n".join(page_blocks)
     total_pages  = max((c.get("page_num") or 0) for c in all_chunks)
 
-    study_prompt = f"""You are an expert academic tutor helping a student prepare for an examination.
+    study_prompt = f"""You are an expert academic tutor helping a student deeply understand their course material, prepare for exams, and solve practice problems.
 
 Document(s): {filenames}
 Total pages: {total_pages}
@@ -743,7 +754,13 @@ Here is the complete page-by-page content of the document:
 
 Student request: "{query}"
 
-Your task — provide a COMPREHENSIVE STUDY GUIDE with the following sections:
+=== INSTRUCTIONS ===
+1. If the Student request contains EXPLICIT formatting instructions (e.g., "Give answers in THIS STRICT FORMAT") or explicitly asks you to SOLVE, EVALUATE, or act as a specific persona (e.g., "university topper", "paper evaluator"):
+-> IGNORE the default study guide format below. Follow the Student's instructions PERFECTLY.
+-> You MUST use your own internal knowledge (parametric memory) to solve problems, evaluate answers, and provide detailed explanations that might not be explicitly written in the Document context. Use the Document primarily as the source of the questions/topics.
+
+2. OTHERWISE, if the Student request is a general study request (e.g., "help me study", "what are the important topics"):
+-> Provide a COMPREHENSIVE STUDY GUIDE with the following sections based ONLY on the document content:
 
 ## 📋 Table of Contents
 List ALL major topics / chapters found in this document with their page numbers.
@@ -761,9 +778,7 @@ Identify exactly 5 page numbers that contain the most exam-critical content. For
 List 8-10 bullet points of the most important definitions, formulas, or facts from the entire document.
 
 ## 📝 Suggested Reading Order
-Recommend the best order to read the document pages for exam preparation.
-
-Base your entire response on the document content above. Be specific with page numbers."""
+Recommend the best order to read the document pages for exam preparation."""
 
     start  = time.time()
     answer_text, tokens = await llm_generate(study_prompt)
@@ -1041,6 +1056,9 @@ async def upload_document(file: UploadFile = File(...), session_id: Optional[int
         doc_id = "doc_" + hashlib.sha256(content).hexdigest()[:12]
         chunks = chunk_text_hierarchical(pages, doc_id)
         print(f"[UPLOAD]       → {page_count} pages, {len(chunks)} chunks")
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Could not extract any text from the PDF. It might be a scanned image or completely empty.")
 
         # Layer 2: Generate embeddings
         print(f"[UPLOAD] [2/4] Generating embeddings…")
@@ -1091,6 +1109,8 @@ async def upload_document(file: UploadFile = File(...), session_id: Optional[int
 
         return result
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         print(f"[UPLOAD ERROR] {e}")
         import traceback; traceback.print_exc()
@@ -1240,6 +1260,7 @@ async def ask_question(request: QueryRequest, raw_request: Request):
                 generation_time_ms=timing.get("generation_time_ms", 0), total_time_ms=total_time,
                 mmr_diversity_score=0.0, avg_retrieval_score=confidence, reflection_validated=False,
                 language_detected=lang_detected, original_query=original_query, rewritten_query=english_query,
+                user_id=user_id,
             )
             resp = QueryResponse(
                 answer=answer_text, citations=citations, confidence=confidence,
@@ -1290,6 +1311,7 @@ async def ask_question(request: QueryRequest, raw_request: Request):
                 generation_time_ms=gen["generation_time_ms"], total_time_ms=total_time,
                 mmr_diversity_score=1.0, avg_retrieval_score=1.0, reflection_validated=True,
                 language_detected=lang_detected, original_query=original_query, rewritten_query=english_query,
+                user_id=user_id,
             )
             resp = QueryResponse(
                 answer=answer, citations=cit_list[:20], confidence=0.92,
@@ -1388,6 +1410,7 @@ async def ask_question(request: QueryRequest, raw_request: Request):
                 language_detected=lang_detected,
                 original_query=original_query,
                 rewritten_query=rewritten_query,
+                user_id=user_id,
             )
 
             return QueryResponse(
@@ -1526,6 +1549,7 @@ async def ask_question(request: QueryRequest, raw_request: Request):
             language_detected=lang_detected,
             original_query=original_query,
             rewritten_query=rewritten_query,
+            user_id=user_id,
         )
 
         resp = QueryResponse(
@@ -1559,19 +1583,7 @@ async def ask_question(request: QueryRequest, raw_request: Request):
         raise HTTPException(500, str(e))
 
 
-@app.get("/api/v1/progress")
-async def get_progress():
-    """Return learning progress stats from NeonDB."""
-    analytics = await db.get_analytics()
-    return {
-        "documents_uploaded": analytics.get("total_documents", len(documents_store)),
-        "total_questions":    analytics.get("total_queries", 0),
-        "avg_confidence":     round(analytics.get("avg_confidence", 0.0), 4),
-        "reflection_rate":    round(analytics.get("reflection_rate", 0.0), 4),
-        "avg_retrieval_score": round(analytics.get("avg_retrieval_score", 0.0), 4),
-        "query_types":        analytics.get("query_types", {}),
-        "languages_used":     analytics.get("languages", {}),
-    }
+# NOTE: /api/v1/progress is now handled by routes_progress.py (per-user, authenticated)
 
 
 @app.get("/api/v1/query/history")
@@ -1615,9 +1627,9 @@ if __name__ == "__main__":
     llm_info = get_provider_info()
     print(f"LLM Provider : {llm_info['provider'].upper()} ({llm_info['model']})")
     print(f"Embed Model  : {EmbeddingService.MODEL_NAME}")
-    port = int(os.getenv("PORT", 8000))
-    print(f"Server       : http://localhost:{port}")
-    print(f"API Docs     : http://localhost:{port}/docs")
+    print(f"Server       : http://localhost:8000")
+    print(f"API Docs     : http://localhost:8000/docs")
     print("=" * 70)
 
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
